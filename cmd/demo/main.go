@@ -22,9 +22,10 @@ import (
 
 func main() {
 	dataPath := flag.String("data", "/tmp/ajq-demo/queue.json", "持久化数据文件路径")
-	enqueue := flag.String("enqueue", "", "入队一条 payload（payload 前缀 fatal: 表示不可恢复失败，fail: 表示前几次可重试失败）")
+	enqueue := flag.String("enqueue", "", "入队一条 payload（payload 前缀 fatal: 表示不可恢复失败，fail: 表示前几次可重试失败，long:<秒数> 表示会上报进度的长任务）")
 	workers := flag.Int("workers", 2, "消费者并发数")
 	duration := flag.Duration("run", 3*time.Second, "消费者运行时长（0 表示直到信号）")
+	shutdownGrace := flag.Duration("shutdown-grace", 5*time.Second, "优雅关闭截止时间：到点未退出的在途处理强制退回（0 表示一直等）")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "[demo] ", log.LstdFlags|log.Lmsgprefix)
@@ -57,8 +58,10 @@ func main() {
 	//   "ok:..."              总是成功
 	//   "fatal:..."           不可恢复失败，直接死信
 	//   "fail:<n>:..."        前 n 次可重试失败，之后成功
+	//   "long:<秒数>:..."     长任务：执行期间每 200ms 上报一次百分比与阶段，
+	//                         进度持久化在数据文件里（重启后仍可查询）
 	//   其他                   总是可重试失败，最终耗尽进入死信
-	handler := func(_ context.Context, t *queue.Task) error {
+	handler := func(ctx context.Context, t *queue.Task) error {
 		switch {
 		case strings.HasPrefix(t.Payload, "ok:"):
 			return nil
@@ -69,6 +72,32 @@ func main() {
 			var rest string
 			if _, err := fmt.Sscanf(t.Payload, "fail:%d:%s", &n, &rest); err == nil && t.Attempts <= n {
 				return queue.Retryable(fmt.Errorf("transient failure attempt %d/%d", t.Attempts, n))
+			}
+			return nil
+		case strings.HasPrefix(t.Payload, "long:"):
+			var secs int
+			var rest string
+			if _, err := fmt.Sscanf(t.Payload, "long:%d:%s", &secs, &rest); err != nil {
+				secs = 2
+			}
+			if secs <= 0 {
+				secs = 2
+			}
+			reporter := queue.ProgressFromContext(ctx)
+			startFrom := t.ProgressPercent // 重启/重投后从上次进度继续，不倒退
+			steps := secs * 5              // 每 200ms 一步
+			for i := 0; i <= steps; i++ {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(200 * time.Millisecond):
+				}
+				pct := startFrom + (100-startFrom)*i/steps
+				stage := fmt.Sprintf("processing %s (%d/%d ticks)", rest, i, steps)
+				if reporter != nil {
+					reporter.Report(pct, stage) // 非阻塞；后台节流落盘
+				}
+				logger.Printf("tick task=%s attempt=%d progress=%d%% stage=%q", t.ID, t.Attempts, pct, stage)
 			}
 			return nil
 		default:
@@ -85,14 +114,21 @@ func main() {
 		defer cancel()
 	}
 
-	consumer := queue.NewConsumer(q, *workers, handler)
-	logger.Printf("consumer starting workers=%d lease=%s data=%s", *workers, cfg.LeaseDuration, *dataPath)
-	if err := consumer.Run(ctx); err != nil {
-		logger.Fatalf("consumer stopped with error: %v", err)
+	consumer := queue.NewConsumer(q, *workers, handler,
+		queue.WithShutdownGrace(*shutdownGrace))
+	logger.Printf("consumer starting workers=%d lease=%s shutdownGrace=%s data=%s",
+		*workers, cfg.LeaseDuration, *shutdownGrace, *dataPath)
+	runErr := consumer.Run(ctx)
+	if runErr != nil && !errors.Is(runErr, queue.ErrShutdownDeadlineExceeded) {
+		logger.Fatalf("consumer stopped with error: %v", runErr)
+	}
+	if errors.Is(runErr, queue.ErrShutdownDeadlineExceeded) {
+		logger.Printf("consumer stopped: %v（未完成任务已强制退回，可重新投递）", runErr)
 	}
 
 	for _, t := range q.Snapshot() {
-		logger.Printf("final task=%s status=%s attempts=%d visibleAt=%s reason=%q",
-			t.ID, t.Status, t.Attempts, t.VisibleAt.Format(time.RFC3339), t.DeadReason)
+		logger.Printf("final task=%s status=%s attempts=%d progress=%d%% stage=%q reportedAt=%s visibleAt=%s reason=%q",
+			t.ID, t.Status, t.Attempts, t.ProgressPercent, t.ProgressStage,
+			t.ProgressReportedAt.Format(time.RFC3339), t.VisibleAt.Format(time.RFC3339), t.DeadReason)
 	}
 }

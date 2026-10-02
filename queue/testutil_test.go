@@ -2,6 +2,8 @@ package queue
 
 import (
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -56,13 +58,36 @@ func statusOf(t *testing.T, q *Queue, id string) *Task {
 }
 
 // failCountLogger 同时记录日志条数（用于验证消费过程确实输出了判定依据）。
+// mu 保护 lines：日志由 worker goroutine 写入，断言由测试 goroutine 读取。
 type failCountLogger struct {
 	t     *testing.T
+	mu    sync.Mutex
 	lines []string
 }
 
 func (l *failCountLogger) Printf(format string, args ...any) {
 	line := fmt.Sprintf(format, args...)
+	l.mu.Lock()
 	l.lines = append(l.lines, line)
+	l.mu.Unlock()
 	l.t.Logf("[queue-log] %s", line)
+}
+
+// snapshotLines 返回已记录日志的拷贝。
+func (l *failCountLogger) snapshotLines() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.lines...)
+}
+
+// linesContain 报告已记录日志中是否存在包含 sub 的行。
+func (l *failCountLogger) linesContain(sub string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		if strings.Contains(line, sub) {
+			return true
+		}
+	}
+	return false
 }

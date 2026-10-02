@@ -20,6 +20,10 @@ var (
 	// ErrInvalidLease 租约无效：任务不在 running 状态，或令牌不匹配
 	//（过期后被重新投递给他人、或重复 ack/nack 时返回）。
 	ErrInvalidLease = errors.New("invalid or expired lease")
+	// ErrInvalidProgress 进度参数非法：百分比超出 [0,100]。
+	ErrInvalidProgress = errors.New("invalid progress")
+	// ErrProgressRegressed 进度倒退：上报百分比低于已持久化的值（含重启恢复后），拒绝。
+	ErrProgressRegressed = errors.New("progress would regress")
 )
 
 // Config 队列配置。
@@ -277,6 +281,44 @@ func (q *Queue) Nack(ctx context.Context, taskID, token string, taskErr *TaskErr
 		t.VisibleAt = now.Add(backoff)
 		t.UpdatedAt = now
 	}
+	return q.persistLocked(ctx)
+}
+
+// ReportProgress 由当前租约持有者上报执行进度，并在成功返回前原子落盘：
+//   - 任务必须处于 running 且 token 为当前租约令牌；任务被重新投递（租约超时、
+//     重启恢复、关闭退回）后，上一轮旧执行持有的旧令牌一律返回 ErrInvalidLease，
+//     其迟到上报不会覆盖新一轮的进度；
+//   - percent 必须落在 [0,100]，否则返回 ErrInvalidProgress；
+//   - 进度百分比单调只增：percent 低于已持久化值（包括进程重启后读到的值）时
+//     返回 ErrProgressRegressed，任务状态不变，重启不会让进度倒退；
+//   - percent 相等的上报允许通过，用于只更新阶段文字；stage 原样记录。
+//
+// 落盘成功后 UpdatedAt/ProgressReportedAt 都会更新。Get/Snapshot 读到的
+// 进度与数据文件中的内容一致（未被接受的上报不会留在内存态里）。
+func (q *Queue) ReportProgress(ctx context.Context, taskID, token string, percent int, stage string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	t, ok := q.tasks[taskID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	}
+	if t.Status != StatusRunning || t.LeaseToken != token {
+		return fmt.Errorf("%w: task=%s status=%s", ErrInvalidLease, taskID, t.Status)
+	}
+	if percent < 0 || percent > 100 {
+		return fmt.Errorf("%w: task=%s percent=%d", ErrInvalidProgress, taskID, percent)
+	}
+	if percent < t.ProgressPercent {
+		return fmt.Errorf("%w: task=%s reported=%d persisted=%d",
+			ErrProgressRegressed, taskID, percent, t.ProgressPercent)
+	}
+
+	now := time.Now()
+	t.ProgressPercent = percent
+	t.ProgressStage = stage
+	t.ProgressReportedAt = now
+	t.UpdatedAt = now
 	return q.persistLocked(ctx)
 }
 

@@ -73,7 +73,12 @@ type Task struct {
 	LeaseToken   string     `json:"lease_token"`   // 租约令牌，ack/nack 时校验归属
 	LeaseExpires time.Time  `json:"lease_expires"` // 租约超时时刻
 	DeadReason   string     `json:"dead_reason"`   // 进入死信的可追溯原因
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// 进度信息（长耗时任务由当前租约持有者上报，单调只增）。
+	// 旧版本写出的数据文件没有这些字段，加载后为零值（0% / 空阶段 / 零时刻）。
+	ProgressPercent    int       `json:"progress_percent"`     // 整体百分比 [0,100]，只接受不小于已有值的上报
+	ProgressStage      string    `json:"progress_stage"`       // 当前阶段的文字说明
+	ProgressReportedAt time.Time `json:"progress_reported_at"` // 最近一次成功（被接受并落盘）上报的时刻
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // Terminal 报告任务是否处于不再投递的终态。

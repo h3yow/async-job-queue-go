@@ -52,9 +52,20 @@ func TestConcurrentConsumersProcessEachTaskOnce(t *testing.T) {
 
 	waitFor(t, func() bool {
 		mu.Lock()
-		defer mu.Unlock()
-		return len(seen) == nTasks
-	}, "all tasks handled")
+		handled := len(seen) == nTasks
+		mu.Unlock()
+		if !handled {
+			return false
+		}
+		// handler 跑完不等于任务已 Ack 落盘，必须等全部到达 succeeded
+		//（Ack 可能与最后的进度收尾落盘交错，避免在 running 状态下提前断言）。
+		for _, id := range ids {
+			if g, ok := q.Get(id); !ok || g.Status != StatusSucceeded {
+				return false
+			}
+		}
+		return true
+	}, "all tasks handled and acked as succeeded")
 
 	for _, id := range ids {
 		if g := statusOf(t, q, id); g.Status != StatusSucceeded {

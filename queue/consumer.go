@@ -3,10 +3,18 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sync"
 	"time"
+)
+
+// 常见关闭结果，调用方可用 errors.Is 判定。
+var (
+	// ErrShutdownDeadlineExceeded 优雅关闭超过截止时间：仍有 handler 未退出，
+	// 队列已强制把其租约退回 pending（任务不丢、可重新投递），Run 返回本错误。
+	ErrShutdownDeadlineExceeded = errors.New("shutdown deadline exceeded; in-flight leases force-requeued")
 )
 
 // Logger 队列运行日志接口（测试可替换为 testing.T）。
@@ -18,16 +26,20 @@ type Logger interface {
 //   - 返回 nil：任务成功，消费者调用 Ack；
 //   - 返回 *TaskError（Retryable/NonRetryable）：按声明语义 Nack；
 //   - 返回其他 error：按可重试失败处理。
+//
+// 长耗时任务可用 ProgressFromContext(ctx) 拿到本次投递专属的进度上报器。
 type Handler func(ctx context.Context, task *Task) error
 
 // Consumer 从队列拉取任务并以固定数量 worker 并发处理。
 type Consumer struct {
-	queue        *Queue
-	handler      Handler
-	workers      int
-	instance     string
-	pollInterval time.Duration
-	logger       Logger
+	queue              *Queue
+	handler            Handler
+	workers            int
+	instance           string
+	pollInterval       time.Duration
+	shutdownGrace      time.Duration // 关闭时等待在途 handler 的截止时间
+	progressFlushEvery time.Duration // 进度上报最小落盘间隔
+	logger             Logger
 }
 
 // ConsumerOption 配置可选项。
@@ -36,6 +48,20 @@ type ConsumerOption func(*Consumer)
 // WithPollInterval 设置空闲轮询间隔，默认 100ms。
 func WithPollInterval(d time.Duration) ConsumerOption {
 	return func(c *Consumer) { c.pollInterval = d }
+}
+
+// WithShutdownGrace 设置优雅关闭的截止时间：ctx 取消后，已在途的 handler
+// 最多再等多久；到点仍未退出则强制退回其租约（Run 返回
+// ErrShutdownDeadlineExceeded）。默认 10s；传 0 表示无截止（一直等，
+// 与旧版本行为一致）。
+func WithShutdownGrace(d time.Duration) ConsumerOption {
+	return func(c *Consumer) { c.shutdownGrace = d }
+}
+
+// WithProgressFlushInterval 设置进度上报的最小落盘间隔，默认 200ms。
+// 间隔内的多次上报合并为最新一条落盘，handler 侧调用始终非阻塞。
+func WithProgressFlushInterval(d time.Duration) ConsumerOption {
+	return func(c *Consumer) { c.progressFlushEvery = d }
 }
 
 // WithLogger 替换日志输出。
@@ -53,12 +79,14 @@ func NewConsumer(q *Queue, workers int, h Handler, opts ...ConsumerOption) *Cons
 		workers = 1
 	}
 	c := &Consumer{
-		queue:        q,
-		handler:      h,
-		workers:      workers,
-		instance:     q.InstanceID(),
-		pollInterval: 100 * time.Millisecond,
-		logger:       log.New(os.Stderr, "[consumer] ", log.LstdFlags|log.Lmsgprefix),
+		queue:              q,
+		handler:            h,
+		workers:            workers,
+		instance:           q.InstanceID(),
+		pollInterval:       100 * time.Millisecond,
+		shutdownGrace:      10 * time.Second,
+		progressFlushEvery: DefaultProgressFlushInterval,
+		logger:             log.New(os.Stderr, "[consumer] ", log.LstdFlags|log.Lmsgprefix),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -66,13 +94,16 @@ func NewConsumer(q *Queue, workers int, h Handler, opts ...ConsumerOption) *Cons
 	return c
 }
 
-// Run 启动 worker 循环直到 ctx 被取消：
-//  1. 停止拉取新任务；
-//  2. 取消在途任务的处理上下文，等待所有 worker 退出；
-//  3. 将本实例仍持有（未 Ack/Nack）的租约一次性退回 pending，
-//     使其在重启后/其他消费者处立即可重新投递。
+// Run 启动 worker 循环直到 ctx 被取消。关闭流程：
+//  1. 停止拉取新任务，取消在途任务的处理上下文；
+//  2. 等待在途 handler 退出，最多等待 ShutdownGrace（0 表示无限等待）：
+//     在截止时间内退出的，按其结果正常 Ack/Nack；
+//  3. 到点仍有 handler 未退出时，不再等待——调用 RequeueOwned 强制把本实例
+//     仍持有的租约退回 pending，任务立即可重新投递且不丢失，Run 返回
+//     ErrShutdownDeadlineExceeded；之后迟到的 handler 无论 Ack/Nack 还是
+//     进度上报，都会因令牌失效被拒绝，无法造成重复投递或覆盖新进度。
 //
-// 关闭前已成功完成的任务仍会正常 Ack 落盘，不会被退回。
+// 关闭前已成功 Ack 的任务是终态，不受强制退回影响，不会被再投递一次。
 func (c *Consumer) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -82,7 +113,44 @@ func (c *Consumer) Run(ctx context.Context) error {
 		wg.Add(1)
 		go c.worker(ctx, i, &wg)
 	}
-	wg.Wait()
+
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+	}()
+
+	// 正常运行阶段：等待关闭请求；所有 worker 恰好在此前自行退出也算正常结束。
+	select {
+	case <-ctx.Done():
+	case <-workersDone:
+	}
+
+	// 截止时间从“请求关闭”这一刻起算，而不是从启动起算，
+	// 否则长任务（可能经历租约超时重投）会在无人请求关闭时被误杀。
+	var graceCh <-chan time.Time
+	if c.shutdownGrace > 0 {
+		timer := time.NewTimer(c.shutdownGrace)
+		defer timer.Stop()
+		graceCh = timer.C
+	}
+
+	select {
+	case <-workersDone:
+		// 所有 handler 都在截止时间内结束，走常规优雅关闭。
+	case <-graceCh:
+		// 有 handler 不理会取消、一直跑：强制释放其租约，不再等待。
+		requeued, err := c.queue.RequeueOwned(context.Background())
+		if err != nil {
+			c.logger.Printf("instance=%s shutdown deadline force-requeue failed: %v", c.instance, err)
+			return err
+		}
+		c.logger.Printf("instance=%s shutdown grace=%s exceeded, force-requeued=%d unfinished task(s); "+
+			"late ack/nack/progress from abandoned handlers will be rejected",
+			c.instance, c.shutdownGrace, requeued)
+		return fmt.Errorf("%w (grace=%s, requeued=%d)",
+			ErrShutdownDeadlineExceeded, c.shutdownGrace, requeued)
+	}
 
 	// 用独立上下文执行退回，避免已取消的 ctx 阻止落盘。
 	requeued, err := c.queue.RequeueOwned(context.Background())
@@ -132,7 +200,23 @@ func (c *Consumer) handle(ctx context.Context, workerID int, lease *Lease) {
 		workerID, task.ID, task.Attempts, task.MaxAttempts,
 		"pending-visible-or-lease-expired")
 
-	err := c.handler(ctx, task.Clone())
+	// 每次投递一个独立上报器：只有持本次令牌的上报才会被队列接受。
+	reporter := newProgressReporter(c.queue, lease, c.progressFlushEvery, c.logger)
+	hctx := withProgressReporter(ctx, reporter)
+
+	err := c.handler(hctx, task.Clone())
+
+	// 先收尾上报器（把最后一条进度同步落盘）；若租约已失效（超时重投/关闭强制退回），
+	// 这里与后续 Ack/Nack 一样会得到 ErrInvalidLease，旧执行无法覆盖新进度。
+	if perr := reporter.close(context.Background()); perr != nil {
+		if errors.Is(perr, ErrInvalidLease) {
+			c.logger.Printf("worker=%d stale-progress task=%s attempt=%d verdict=rejected basis=%q",
+				workerID, task.ID, task.Attempts, "lease token mismatch (redelivered or force-requeued)")
+		} else {
+			c.logger.Printf("worker=%d progress-flush-error task=%s attempt=%d err=%v",
+				workerID, task.ID, task.Attempts, perr)
+		}
+	}
 
 	switch {
 	case err == nil:
