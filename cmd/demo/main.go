@@ -22,9 +22,10 @@ import (
 
 func main() {
 	dataPath := flag.String("data", "/tmp/ajq-demo/queue.json", "持久化数据文件路径")
-	enqueue := flag.String("enqueue", "", "入队一条 payload（payload 前缀 fatal: 表示不可恢复失败，fail: 表示前几次可重试失败）")
+	enqueue := flag.String("enqueue", "", "入队一条 payload（前缀 slow:<秒>: 模拟长任务并上报进度，fatal: 不可恢复失败，fail:<n>: 前 n 次可重试失败）")
 	workers := flag.Int("workers", 2, "消费者并发数")
 	duration := flag.Duration("run", 3*time.Second, "消费者运行时长（0 表示直到信号）")
+	shutdownTimeout := flag.Duration("shutdown-timeout", 5*time.Second, "优雅关闭等待在途 handler 的截止时间，到期强制退回租约")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "[demo] ", log.LstdFlags|log.Lmsgprefix)
@@ -55,12 +56,37 @@ func main() {
 
 	// 任务处理器：
 	//   "ok:..."              总是成功
+	//   "slow:<秒>:..."       模拟长耗时任务：每 200ms 推进一步并上报进度（百分比 + 阶段说明）
 	//   "fatal:..."           不可恢复失败，直接死信
 	//   "fail:<n>:..."        前 n 次可重试失败，之后成功
 	//   其他                   总是可重试失败，最终耗尽进入死信
-	handler := func(_ context.Context, t *queue.Task) error {
+	handler := func(ctx context.Context, t *queue.Task) error {
 		switch {
 		case strings.HasPrefix(t.Payload, "ok:"):
+			return nil
+		case strings.HasPrefix(t.Payload, "slow:"):
+			var secs int
+			var rest string
+			if _, err := fmt.Sscanf(t.Payload, "slow:%d:%s", &secs, &rest); err != nil || secs <= 0 {
+				return queue.NonRetryable(fmt.Errorf("bad slow payload %q", t.Payload))
+			}
+			pr, _ := queue.ProgressReporterFromContext(ctx)
+			steps := secs * 5 // 每步 200ms
+			for i := 1; i <= steps; i++ {
+				select {
+				case <-ctx.Done():
+					return ctx.Err() // 关闭时被取消，租约由消费者退回
+				case <-time.After(200 * time.Millisecond):
+				}
+				if pr != nil {
+					pct := i * 100 / steps
+					if err := pr.Report(pct, fmt.Sprintf("阶段 %d/%d", i, steps)); err != nil {
+						logger.Printf("task=%s progress report rejected: %v", t.ID, err)
+						return nil // 租约已易主，旧执行直接放弃
+					}
+					logger.Printf("task=%s attempt=%d progress=%d%%", t.ID, t.Attempts, pct)
+				}
+			}
 			return nil
 		case strings.HasPrefix(t.Payload, "fatal:"):
 			return queue.NonRetryable(errors.New("fatal payload: " + t.Payload))
@@ -85,14 +111,17 @@ func main() {
 		defer cancel()
 	}
 
-	consumer := queue.NewConsumer(q, *workers, handler)
-	logger.Printf("consumer starting workers=%d lease=%s data=%s", *workers, cfg.LeaseDuration, *dataPath)
+	consumer := queue.NewConsumer(q, *workers, handler,
+		queue.WithShutdownTimeout(*shutdownTimeout))
+	logger.Printf("consumer starting workers=%d lease=%s shutdown-timeout=%s data=%s",
+		*workers, cfg.LeaseDuration, *shutdownTimeout, *dataPath)
 	if err := consumer.Run(ctx); err != nil {
 		logger.Fatalf("consumer stopped with error: %v", err)
 	}
 
 	for _, t := range q.Snapshot() {
-		logger.Printf("final task=%s status=%s attempts=%d visibleAt=%s reason=%q",
-			t.ID, t.Status, t.Attempts, t.VisibleAt.Format(time.RFC3339), t.DeadReason)
+		logger.Printf("final task=%s status=%s attempts=%d progress=%d%% stage=%q visibleAt=%s reason=%q",
+			t.ID, t.Status, t.Attempts, t.Progress.Percent, t.Progress.Message,
+			t.VisibleAt.Format(time.RFC3339), t.DeadReason)
 	}
 }

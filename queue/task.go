@@ -60,6 +60,20 @@ func NonRetryable(err error) *TaskError {
 	return &TaskError{Kind: FailureNonRetryable, Err: err}
 }
 
+// Progress 长耗时任务的执行进度，随任务记录一起持久化。
+// 零值（Percent=0、Message=""、UpdatedAt 为零时间）表示从未上报过；
+// 旧版本写出的数据文件没有该字段，加载后即为零值，语义兼容。
+type Progress struct {
+	Percent   int       `json:"percent"`    // 整体完成百分比，取值 [0,100]（上报时会被钳制到该区间）
+	Message   string    `json:"message"`    // 当前阶段的文字说明，如 "导出第 3/8 段"
+	UpdatedAt time.Time `json:"updated_at"` // 最近一次成功上报（已落盘）的时刻
+}
+
+// Reported 报告该任务是否至少成功上报过一次进度。
+func (p Progress) Reported() bool {
+	return !p.UpdatedAt.IsZero()
+}
+
 // Task 是队列中一条任务的持久化记录（JSON 落盘，进程重启后据此恢复）。
 type Task struct {
 	ID           string     `json:"id"`
@@ -73,7 +87,10 @@ type Task struct {
 	LeaseToken   string     `json:"lease_token"`   // 租约令牌，ack/nack 时校验归属
 	LeaseExpires time.Time  `json:"lease_expires"` // 租约超时时刻
 	DeadReason   string     `json:"dead_reason"`   // 进入死信的可追溯原因
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// Progress 最后一次成功上报的进度。任务进入 succeeded/dead 终态后保留，
+	// 用于事后排查；重启后从数据文件原样恢复，不会回退。
+	Progress  Progress  `json:"progress"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Terminal 报告任务是否处于不再投递的终态。

@@ -6,10 +6,10 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `queue/task.go` | 任务模型、状态机、失败分类（可重试 / 不可恢复） |
+| `queue/task.go` | 任务模型、状态机、失败分类（可重试 / 不可恢复）、进度模型 |
 | `queue/store.go` | `Store` 接口与 `FileStore`：临时文件 + fsync + rename 原子落盘 |
-| `queue/queue.go` | 队列核心：入队、投递、租约、Ack/Nack、退避、死信、重启恢复、优雅退回 |
-| `queue/consumer.go` | 多 worker 并发消费者与优雅关闭 |
+| `queue/queue.go` | 队列核心：入队、投递、租约、Ack/Nack、退避、死信、重启恢复、优雅退回、进度上报与查询 |
+| `queue/consumer.go` | 多 worker 并发消费者、进度上报器注入、带截止时间的优雅关闭 |
 | `cmd/demo` | 本地手工验证用的命令行演示 |
 
 ## 任务状态机
@@ -62,13 +62,63 @@
 - `succeeded` / `dead` 原样保留（含死信原因）；
 - `Attempts`（已投递次数）**只增不减、跨重启保留**，恢复重投继续累计，用于判定重试额度。
 
-### 4. 优雅关闭
+### 4. 优雅关闭（带截止时间）
 
 `Consumer.Run` 在 `ctx` 取消后：
 
 1. worker 停止拉取新任务，在途 handler 的 context 被取消；
-2. 等待所有 worker 退出（关闭前已处理成功的任务仍会正常 Ack 落盘）；
+2. 等待所有 worker 退出，**最长等待 `shutdownTimeout`**（默认 30s，`WithShutdownTimeout` 可调；`<=0` 表示无限等待）。关闭前已处理成功的任务仍会正常 Ack 落盘；
 3. 调用 `RequeueOwned` 把本实例仍持有的未完成租约**立即退回 `pending`**（退避为 0），重启后或其他实例无需等待租约超时即可接管。
+
+**截止时间到期仍有 handler 不退出**（不理会取消、一直跑）时，Run 不再无限阻塞：
+
+- 强制退回这些在途租约后直接返回，任务回到 `pending` **重新可投递、不会丢**；
+- 强制退回会轮换租约令牌，失控 handler 之后迟到的 Ack/Nack/进度上报都会被拒绝（`ErrInvalidLease`），不会覆盖新一轮投递的结论与进度；
+- 已经 Ack 成功的任务是终态，`RequeueOwned` 不会触碰，**不会因超时释放被再次投递**；
+- 注意这是 at-least-once 语义的固有取舍：被强制退回的任务可能在新一轮投递中与失控的旧 handler 短暂并发执行，handler 应具备幂等性。
+
+## 进度上报与查询（长耗时任务）
+
+### 上报语义
+
+长任务 handler 通过消费者注入的进度上报器上报进度（整体百分比 + 当前阶段说明）：
+
+```go
+handler := func(ctx context.Context, t *queue.Task) error {
+    pr, ok := queue.ProgressReporterFromContext(ctx)
+    for i, seg := range segments {
+        if err := process(ctx, seg); err != nil { return queue.Retryable(err) }
+        if ok {
+            if err := pr.Report((i+1)*100/len(segments), fmt.Sprintf("第 %d/%d 段", i+1, len(segments))); err != nil {
+                return nil // 租约已易主（ErrInvalidLease），旧执行应放弃
+            }
+        }
+    }
+    return nil
+}
+```
+
+也可以绕过消费者直接调用 `Queue.ReportProgress(ctx, taskID, leaseToken, percent, message)`。语义：
+
+- **仅当前租约持有者可上报**：任务处于 `running` 且令牌匹配才接受；租约超时被重新投递后令牌轮换，**旧执行迟到的上报返回 `ErrInvalidLease`，不会覆盖新一轮租约的进度**；终态（succeeded/dead）后任何上报同样被拒绝；
+- **成功即持久**：每次成功上报随全量快照原子落盘（与其他状态变更同一机制），`percent` 钳制到 `[0,100]`；
+- **重启不回退**：进程重启/崩溃恢复后读到的是最后一次成功上报的进度与上报时间，不会变回零值、也不会倒退；
+- **频率建议**：上报是同步落盘的（一次小文件原子重写，毫秒级），与队列其他状态变更串行化的时间很短，不会阻塞其他 worker 的处理逻辑本身；但建议按阶段或固定节奏（如每几百毫秒）上报，不要每处理一条记录上报一次。
+
+### 查询语义
+
+```go
+p, ok := q.GetProgress(taskID) // 或 q.Get(taskID) 后读 Task.Progress
+```
+
+- 任何状态（处理中、succeeded、dead）都可查询；任务进入终态后**最后上报的进度原样保留**，用于事后排查；
+- 读到的是内存中已落盘的最新值，与数据文件一致，**重启后再查还是同一条**；
+- `Progress.Reported()` 可区分"从未上报"（零值）与"上报过 0%"。
+
+### 旧数据文件兼容
+
+旧版本写出的数据文件没有 `progress` 字段，新版本**可以直接打开**：缺失字段解码为零值（视为"从未上报"），其余字段与恢复语义（running 重置、终态保留、Attempts 累计）完全不变；旧记录被重新投递后即可正常上报进度。反向不保证：新版写出的文件含 `progress` 字段，旧版本代码读取时会忽略未知字段，可正常加载但看不到进度。
+
 
 ## 失败分类、重试与退避
 
@@ -128,6 +178,12 @@ go test ./... -race -count=1 -v
 | `TestConsumerRetriesThenSucceeds` | 消费侧重试退避后成功，投递次数准确 |
 | `TestLeaseTakeoverAcrossInstances` | 慢 handler 租约超时被重投，迟到 Ack 被拒，结论唯一 |
 | `TestConsumerShutdownRequeuesInflight` | 在途任务随优雅关闭退回 pending |
+| `TestProgressPersistsAcrossRestart` | 进度上报落盘，重启后保留最后上报值、不倒退 |
+| `TestStaleLeaseProgressReportRejected` | 租约轮换后旧执行的迟到进度上报被拒，不覆盖新进度 |
+| `TestProgressRetainedAfterTerminalStates` | succeeded/dead 终态后进度仍可查，重启后一致 |
+| `TestOldDataFileWithoutProgressLoads` | 无 progress 字段的旧数据文件直接加载，功能不受影响 |
+| `TestShutdownTimeoutForceRequeuesInflight` | 关闭截止到期强制释放在途租约，任务重新可投递、已 Ack 任务不受影响 |
+| `TestProgressReportingDoesNotBlockProcessing` | 长任务频繁上报进度时其他任务正常完成 |
 | `TestFileStoreRoundTrip` / `TestFileStoreNoLeftoverTempFiles` | 持久化往返与原子替换 |
 
 单测日志（`-v` 可见）统一打印 **任务标识、投递次数（attempt N/M）与判定依据（basis）**，例如：
@@ -141,16 +197,18 @@ go test ./... -race -count=1 -v
 ### 命令行演示
 
 ```bash
-# 生产几条任务（payload 语义：ok: 成功；fail:<n>: 前 n 次失败后成功；fatal: 立即死信；其他一直失败）
+# 生产几条任务（payload 语义：ok: 成功；slow:<秒>: 长任务并上报进度；
+# fail:<n>: 前 n 次失败后成功；fatal: 立即死信；其他一直失败）
 go run ./cmd/demo -data /tmp/ajq-demo/q.json -run=-1s -enqueue 'ok:first'
+go run ./cmd/demo -data /tmp/ajq-demo/q.json -run=-1s -enqueue 'slow:30:export'
 go run ./cmd/demo -data /tmp/ajq-demo/q.json -run=-1s -enqueue 'fail:2:retry-me'
 go run ./cmd/demo -data /tmp/ajq-demo/q.json -run=-1s -enqueue 'fatal:bad'
-go run ./cmd/demo -data /tmp/ajq-demo/q.json -run=-1s -enqueue 'always-boom'
 
-# 消费（短时长模拟一次进程生命周期，Ctrl-C 触发优雅关闭）
-go run ./cmd/demo -data /tmp/ajq-demo/q.json -workers 3 -run 3s
+# 消费（短时长模拟一次进程生命周期，Ctrl-C 触发优雅关闭；
+# -shutdown-timeout 控制等待在途 handler 的截止时间，到期强制退回租约）
+go run ./cmd/demo -data /tmp/ajq-demo/q.json -workers 3 -run 3s -shutdown-timeout 1s
 
-# 再次运行即"进程重启"：succeeded/dead 保持，退避任务继续重试直至死信
+# 再次运行即"进程重启"：succeeded/dead 保持，长任务进度保留在最后上报值并继续推进
 go run ./cmd/demo -data /tmp/ajq-demo/q.json -run 3s
 ```
 
@@ -163,13 +221,21 @@ q, _ := queue.New(queue.DefaultConfig(), store, "instance-1") // 启动即恢复
 task, _ := q.Enqueue(ctx, payload)
 
 consumer := queue.NewConsumer(q, 4, func(ctx context.Context, t *queue.Task) error {
-    if err := doWork(ctx, t.Payload); err != nil {
+    pr, hasProgress := queue.ProgressReporterFromContext(ctx) // 长任务进度上报
+    if err := doWork(ctx, t.Payload, func(pct int, stage string) {
+        if hasProgress {
+            _ = pr.Report(pct, stage) // 成功即落盘；ErrInvalidLease 表示租约已易主
+        }
+    }); err != nil {
         if permanent(err) {
             return queue.NonRetryable(err) // 直接死信
         }
         return queue.Retryable(err)       // 退避重试
     }
     return nil
-})
+}, queue.WithShutdownTimeout(10*time.Second)) // 关闭等待在途 handler 的截止时间
 consumer.Run(ctx) // ctx 取消后优雅关闭，未完成任务自动退回可投递
+
+// 随时查询进度（含终态任务的最后进度），重启后结果一致
+progress, _ := q.GetProgress(task.ID)
 ```

@@ -280,6 +280,55 @@ func (q *Queue) Nack(ctx context.Context, taskID, token string, taskErr *TaskErr
 	return q.persistLocked(ctx)
 }
 
+// ReportProgress 上报任务执行进度（整体百分比 + 当前阶段说明）。
+// 仅当任务仍处于 running 且令牌匹配当前租约持有者时接受：
+// 租约超时后被重新投递、令牌已轮换，旧执行迟到的上报返回 ErrInvalidLease，
+// 不会覆盖新一轮租约期间上报的进度。
+//
+// 每次成功上报都随全量快照原子落盘，因此：
+//   - 进程重启/崩溃恢复后读到的是最后一次成功上报的进度，不会回退为零值；
+//   - 任务随后进入 succeeded/dead 终态时，进度原样保留，可供事后排查。
+//
+// percent 会被钳制到 [0,100]。上报是同步落盘的（一次小文件原子重写），
+// 长任务建议按阶段或固定节奏（如每几百毫秒）上报，而非每处理一条记录上报一次。
+func (q *Queue) ReportProgress(ctx context.Context, taskID, token string, percent int, message string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	t, ok := q.tasks[taskID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	}
+	if t.Status != StatusRunning || t.LeaseToken != token {
+		return fmt.Errorf("%w: task=%s status=%s", ErrInvalidLease, taskID, t.Status)
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	t.Progress = Progress{
+		Percent:   percent,
+		Message:   message,
+		UpdatedAt: time.Now(),
+	}
+	return q.persistLocked(ctx)
+}
+
+// GetProgress 返回任务当前已持久化的进度与是否存在该任务。
+// 与 Get 一样读取内存中已落盘的最新状态，重启后结果一致；
+// 任务处于任何状态（含 succeeded/dead 终态）都可查询。
+func (q *Queue) GetProgress(taskID string) (Progress, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	t, ok := q.tasks[taskID]
+	if !ok {
+		return Progress{}, false
+	}
+	return t.Progress, true
+}
+
 // RequeueOwned 在优雅关闭时把本实例仍持有的 running 任务全部退回 pending，
 // 清空租约并立即可被重新投递（退避为 0），Attempts 保留不回退。
 // 返回退回的任务数。其他实例持有的租约不受影响。

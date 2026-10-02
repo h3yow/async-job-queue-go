@@ -18,16 +18,43 @@ type Logger interface {
 //   - 返回 nil：任务成功，消费者调用 Ack；
 //   - 返回 *TaskError（Retryable/NonRetryable）：按声明语义 Nack；
 //   - 返回其他 error：按可重试失败处理。
+//
+// 长耗时任务可在处理过程中通过 ProgressReporterFromContext 取出
+// 进度上报器并调用 Report 上报进度（见 Queue.ReportProgress 的语义）。
 type Handler func(ctx context.Context, task *Task) error
+
+// ProgressReporter 绑定一次具体投递（任务 + 租约令牌）的进度上报器。
+// 租约超时被重新投递后，旧 reporter 的上报会被队列拒绝（ErrInvalidLease），
+// 不会覆盖新一轮租约的进度。
+type ProgressReporter struct {
+	queue  *Queue
+	taskID string
+	token  string
+}
+
+// Report 上报整体百分比与当前阶段说明；成功返回即已持久化。
+func (r *ProgressReporter) Report(percent int, message string) error {
+	return r.queue.ReportProgress(context.Background(), r.taskID, r.token, percent, message)
+}
+
+type progressReporterKey struct{}
+
+// ProgressReporterFromContext 取出消费者注入 handler 上下文的进度上报器；
+// 在消费者之外（如直接调用 handler 的测试）返回 (nil, false)。
+func ProgressReporterFromContext(ctx context.Context) (*ProgressReporter, bool) {
+	r, ok := ctx.Value(progressReporterKey{}).(*ProgressReporter)
+	return r, ok
+}
 
 // Consumer 从队列拉取任务并以固定数量 worker 并发处理。
 type Consumer struct {
-	queue        *Queue
-	handler      Handler
-	workers      int
-	instance     string
-	pollInterval time.Duration
-	logger       Logger
+	queue           *Queue
+	handler         Handler
+	workers         int
+	instance        string
+	pollInterval    time.Duration
+	shutdownTimeout time.Duration
+	logger          Logger
 }
 
 // ConsumerOption 配置可选项。
@@ -36,6 +63,14 @@ type ConsumerOption func(*Consumer)
 // WithPollInterval 设置空闲轮询间隔，默认 100ms。
 func WithPollInterval(d time.Duration) ConsumerOption {
 	return func(c *Consumer) { c.pollInterval = d }
+}
+
+// WithShutdownTimeout 设置优雅关闭等待在途 handler 退出的截止时间。
+// 到期仍未退出的 handler 不再被等待：其租约被强制退回 pending，
+// 任务重新可投递（不丢任务）；handler 之后迟到的 Ack/Nack 会因令牌
+// 已轮换而被拒绝。默认 30s；<=0 表示无限等待（不推荐）。
+func WithShutdownTimeout(d time.Duration) ConsumerOption {
+	return func(c *Consumer) { c.shutdownTimeout = d }
 }
 
 // WithLogger 替换日志输出。
@@ -53,12 +88,13 @@ func NewConsumer(q *Queue, workers int, h Handler, opts ...ConsumerOption) *Cons
 		workers = 1
 	}
 	c := &Consumer{
-		queue:        q,
-		handler:      h,
-		workers:      workers,
-		instance:     q.InstanceID(),
-		pollInterval: 100 * time.Millisecond,
-		logger:       log.New(os.Stderr, "[consumer] ", log.LstdFlags|log.Lmsgprefix),
+		queue:           q,
+		handler:         h,
+		workers:         workers,
+		instance:        q.InstanceID(),
+		pollInterval:    100 * time.Millisecond,
+		shutdownTimeout: 30 * time.Second,
+		logger:          log.New(os.Stderr, "[consumer] ", log.LstdFlags|log.Lmsgprefix),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -68,11 +104,15 @@ func NewConsumer(q *Queue, workers int, h Handler, opts ...ConsumerOption) *Cons
 
 // Run 启动 worker 循环直到 ctx 被取消：
 //  1. 停止拉取新任务；
-//  2. 取消在途任务的处理上下文，等待所有 worker 退出；
+//  2. 取消在途任务的处理上下文，等待所有 worker 退出，
+//     最长等待 shutdownTimeout（默认 30s，WithShutdownTimeout 可调）；
 //  3. 将本实例仍持有（未 Ack/Nack）的租约一次性退回 pending，
 //     使其在重启后/其他消费者处立即可重新投递。
 //
 // 关闭前已成功完成的任务仍会正常 Ack 落盘，不会被退回。
+// 若等待超过截止时间仍有 handler 不退出（不理会取消），Run 不再阻塞：
+// 强制退回这些在途租约后直接返回，任务不会丢失；失控 handler 后续
+// 迟到的 Ack/Nack/进度上报会因租约令牌已轮换而被拒绝。
 func (c *Consumer) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -82,7 +122,28 @@ func (c *Consumer) Run(ctx context.Context) error {
 		wg.Add(1)
 		go c.worker(ctx, i, &wg)
 	}
-	wg.Wait()
+
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+	}()
+
+	if c.shutdownTimeout > 0 {
+		timer := time.NewTimer(c.shutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-workersDone:
+			c.logger.Printf("instance=%s all workers exited within shutdown deadline %s",
+				c.instance, c.shutdownTimeout)
+		case <-timer.C:
+			c.logger.Printf("instance=%s shutdown deadline %s exceeded, "+
+				"force-releasing inflight leases without waiting for runaway handler(s)",
+				c.instance, c.shutdownTimeout)
+		}
+	} else {
+		<-workersDone
+	}
 
 	// 用独立上下文执行退回，避免已取消的 ctx 阻止落盘。
 	requeued, err := c.queue.RequeueOwned(context.Background())
@@ -132,7 +193,7 @@ func (c *Consumer) handle(ctx context.Context, workerID int, lease *Lease) {
 		workerID, task.ID, task.Attempts, task.MaxAttempts,
 		"pending-visible-or-lease-expired")
 
-	err := c.handler(ctx, task.Clone())
+	err := c.handler(withProgressReporter(ctx, c.queue, task.ID, lease.Token), task.Clone())
 
 	switch {
 	case err == nil:
@@ -176,6 +237,15 @@ func (c *Consumer) handle(ctx context.Context, workerID int, lease *Lease) {
 			workerID, task.ID, task.Attempts, te.Kind,
 			"handler classified failure; retry/backoff or dead-letter applied")
 	}
+}
+
+// withProgressReporter 把绑定本次投递租约的进度上报器注入 handler 上下文。
+func withProgressReporter(ctx context.Context, q *Queue, taskID, token string) context.Context {
+	return context.WithValue(ctx, progressReporterKey{}, &ProgressReporter{
+		queue:  q,
+		taskID: taskID,
+		token:  token,
+	})
 }
 
 // sleep 在 ctx 取消时立即返回 false。
