@@ -62,20 +62,27 @@
 - `succeeded` / `dead` 原样保留（含死信原因）；
 - `Attempts`（已投递次数）**只增不减、跨重启保留**，恢复重投继续累计，用于判定重试额度。
 
-### 4. 优雅关闭（带截止时间）
+### 4. 优雅关闭（等待上限只从关闭时刻起算）
+
+**核心约定：`shutdownTimeout` 是"关闭等待上限"，不是"运行寿命上限"。** 它只在 `Consumer.Run` 的 `ctx` 被取消（真正收到关闭信号）那一刻才开始计时，与消费者此前已经运行了多久**完全无关**。因此：
+
+- **正常运行期间它从不触发**：消费者是常驻进程，单个任务跑几分钟、跑多久都不会自我终止，也不会提前放掉手上的在途租约；
+- **收到关闭后重新获得一份完整的等待上限**：不会因为进程之前已经跑了很久而几乎没有等待余地。
 
 `Consumer.Run` 在 `ctx` 取消后：
 
-1. worker 停止拉取新任务，在途 handler 的 context 被取消；
-2. 等待所有 worker 退出，**最长等待 `shutdownTimeout`**（默认 30s，`WithShutdownTimeout` 可调；`<=0` 表示无限等待）。关闭前已处理成功的任务仍会正常 Ack 落盘；
-3. 调用 `RequeueOwned` 把本实例仍持有的未完成租约**立即退回 `pending`**（退避为 0），重启后或其他实例无需等待租约超时即可接管。
+1. worker 立即停止拉取新任务；**在途 handler 不会被顺手掐断**——其处理上下文不随父 ctx 取消，而是保留一份从关闭时刻才开始计的、完整的宽限期；
+2. 等待所有 worker 退出，**最长等待 `shutdownTimeout`**（默认 30s，`WithShutdownTimeout` 可调；`<=0` 表示无限等待），该截止时间从关闭那一刻起算。在宽限期内跑完、返回 nil 的任务仍会正常 Ack 落盘、判成功，**不会被提前掐断重投**；
+3. 宽限到期后调用 `RequeueOwned` 把本实例仍持有的未完成租约**立即退回 `pending`**（退避为 0），重启后或其他实例无需等待租约超时即可接管。
 
 **截止时间到期仍有 handler 不退出**（不理会取消、一直跑）时，Run 不再无限阻塞：
 
-- 强制退回这些在途租约后直接返回，任务回到 `pending` **重新可投递、不会丢**；
+- 先取消在途 handler 的处理上下文（响应取消的 handler 可据此收尾），随后强制退回这些在途租约并直接返回，任务回到 `pending` **重新可投递、不会丢**；
 - 强制退回会轮换租约令牌，失控 handler 之后迟到的 Ack/Nack/进度上报都会被拒绝（`ErrInvalidLease`），不会覆盖新一轮投递的结论与进度；
 - 已经 Ack 成功的任务是终态，`RequeueOwned` 不会触碰，**不会因超时释放被再次投递**；
 - 注意这是 at-least-once 语义的固有取舍：被强制退回的任务可能在新一轮投递中与失控的旧 handler 短暂并发执行，handler 应具备幂等性。
+
+> 关闭前后两种上下文是分开的：拉取循环使用随关闭立即取消的上下文（停止拉新），单次投递的 handler 使用在宽限期内仍然有效的上下文（让在途任务跑完）。这也是"长任务正常运行不受影响、关闭后还能完整等一等"的实现基础。
 
 ## 进度上报与查询（长耗时任务）
 
@@ -183,6 +190,7 @@ go test ./... -race -count=1 -v
 | `TestProgressRetainedAfterTerminalStates` | succeeded/dead 终态后进度仍可查，重启后一致 |
 | `TestOldDataFileWithoutProgressLoads` | 无 progress 字段的旧数据文件直接加载，功能不受影响 |
 | `TestShutdownTimeoutForceRequeuesInflight` | 关闭截止到期强制释放在途租约，任务重新可投递、已 Ack 任务不受影响 |
+| `TestShutdownTimeoutStartsOnlyAfterShutdown` | 关闭等待上限只从关闭起算：正常运行远超上限不自我终止/不放在途任务；关闭后宽限内跑完判成功、到点不退出才释放重投，旧执行迟到上报/确认被拒 |
 | `TestProgressReportingDoesNotBlockProcessing` | 长任务频繁上报进度时其他任务正常完成 |
 | `TestFileStoreRoundTrip` / `TestFileStoreNoLeftoverTempFiles` | 持久化往返与原子替换 |
 
@@ -212,6 +220,36 @@ go run ./cmd/demo -data /tmp/ajq-demo/q.json -workers 3 -run 3s -shutdown-timeou
 go run ./cmd/demo -data /tmp/ajq-demo/q.json -run 3s
 ```
 
+### 本地复现"正常运行不受关闭上限影响"与"关闭后完整等一等"
+
+**自动化复现（推荐，稳定可重复）**：一条用例同时覆盖两种情况——先不关闭地正常运行一段明显超过关闭等待上限的时间（测试里上限 150ms、正常运行 750ms），再触发关闭观察宽限语义：
+
+```bash
+go test ./queue/ -run TestShutdownTimeoutStartsOnlyAfterShutdown -race -count=1 -v
+```
+
+`-v` 日志可依次看到任务标识、第几次投递与判定依据：
+
+- 正常运行 750ms（≈5 倍上限）后仍输出 `verdict=alive basis="shutdownTimeout timer is created only after ctx cancellation"`，三条在途任务保持 `running attempts=1`（`verdict=no-early-release`）；
+- 长任务在未关闭时放行后 `verdict=succeeded ... attempt=1`（跑多久都不重投）；
+- 关闭后宽限内（50ms < 150ms）跑完的任务 `verdict=succeeded basis="completed within grace period whose deadline starts at shutdown"`；
+- 到点（150ms）仍不退出的失控任务 `verdict=redeliverable`，重新投递为 `attempt=2`，其旧执行的迟到上报/确认 `verdict=rejected`。
+
+**命令行手动复现**（用 Ctrl-C 作为关闭信号，`-run 0` 表示收到信号前一直运行）：
+
+```bash
+# 一条要跑 30s 的长任务，关闭等待上限仅 2s
+go run ./cmd/demo -data /tmp/ajq-demo/grace.json -run=-1s -enqueue 'slow:30:export'
+# 常驻消费：不按 Ctrl-C，就让它跑远超 2s —— 观察进度持续推进、任务保持 running，
+# 消费者绝不会因为"运行超过 2s"而自己退出。
+go run ./cmd/demo -data /tmp/ajq-demo/grace.json -run 0 -shutdown-timeout 2s
+# 跑过若干秒后按 Ctrl-C：此时才开始 2s 宽限。
+#   - 若任务在 2s 内完成 -> 日志 ack ... verdict=succeeded；
+#   - 若 2s 到点仍在跑 -> deadline exceeded, force-releasing，任务退回 pending。
+# 再启动一次即可看到被退回的任务立即重新投递（attempt 递增）：
+go run ./cmd/demo -data /tmp/ajq-demo/grace.json -run 0 -shutdown-timeout 2s
+```
+
 ## 使用示例
 
 ```go
@@ -233,8 +271,8 @@ consumer := queue.NewConsumer(q, 4, func(ctx context.Context, t *queue.Task) err
         return queue.Retryable(err)       // 退避重试
     }
     return nil
-}, queue.WithShutdownTimeout(10*time.Second)) // 关闭等待在途 handler 的截止时间
-consumer.Run(ctx) // ctx 取消后优雅关闭，未完成任务自动退回可投递
+}, queue.WithShutdownTimeout(10*time.Second)) // 关闭后等待在途 handler 的截止时间（只从关闭时刻起算，正常运行不触发）
+consumer.Run(ctx) // 常驻消费直到 ctx 取消；取消后给在途任务完整宽限，到期未完成才退回可投递
 
 // 随时查询进度（含终态任务的最后进度），重启后结果一致
 progress, _ := q.GetProgress(task.ID)

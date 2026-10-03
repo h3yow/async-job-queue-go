@@ -75,7 +75,7 @@ func main() {
 			for i := 1; i <= steps; i++ {
 				select {
 				case <-ctx.Done():
-					return ctx.Err() // 关闭时被取消，租约由消费者退回
+					return ctx.Err() // 关闭宽限到期仍未完成才被取消，租约由消费者退回
 				case <-time.After(200 * time.Millisecond):
 				}
 				if pr != nil {

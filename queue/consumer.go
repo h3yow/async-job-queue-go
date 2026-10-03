@@ -65,7 +65,9 @@ func WithPollInterval(d time.Duration) ConsumerOption {
 	return func(c *Consumer) { c.pollInterval = d }
 }
 
-// WithShutdownTimeout 设置优雅关闭等待在途 handler 退出的截止时间。
+// WithShutdownTimeout 设置优雅关闭时等待在途 handler 退出的截止时间。
+// 该截止时间只从 Run 的 ctx 被取消（真正收到关闭）那一刻开始计时，
+// 与消费者此前已经运行了多久无关；正常消费期间它完全不起作用。
 // 到期仍未退出的 handler 不再被等待：其租约被强制退回 pending，
 // 任务重新可投递（不丢任务）；handler 之后迟到的 Ack/Nack 会因令牌
 // 已轮换而被拒绝。默认 30s；<=0 表示无限等待（不推荐）。
@@ -102,25 +104,34 @@ func NewConsumer(q *Queue, workers int, h Handler, opts ...ConsumerOption) *Cons
 	return c
 }
 
-// Run 启动 worker 循环直到 ctx 被取消：
-//  1. 停止拉取新任务；
-//  2. 取消在途任务的处理上下文，等待所有 worker 退出，
-//     最长等待 shutdownTimeout（默认 30s，WithShutdownTimeout 可调）；
-//  3. 将本实例仍持有（未 Ack/Nack）的租约一次性退回 pending，
-//     使其在重启后/其他消费者处立即可重新投递。
+// Run 启动 worker 循环，直到 ctx 被取消才进入关闭流程：
 //
-// 关闭前已成功完成的任务仍会正常 Ack 落盘，不会被退回。
-// 若等待超过截止时间仍有 handler 不退出（不理会取消），Run 不再阻塞：
-// 强制退回这些在途租约后直接返回，任务不会丢失；失控 handler 后续
-// 迟到的 Ack/Nack/进度上报会因租约令牌已轮换而被拒绝。
+// 正常消费阶段（ctx 未取消）没有任何时长上限：消费者是常驻进程，
+// 单个任务跑多久都不会触发自我终止，也不会放掉手上的在途租约。
+//
+// ctx 取消（真正收到关闭）之后：
+//  1. worker 立即停止拉取新任务；
+//  2. 在途 handler 不被提前掐断，而是拿到一份从关闭时刻才开始计的、
+//     完整的 shutdownTimeout 宽限时间继续运行。在此期间返回 nil 的
+//     handler 仍会正常 Ack 落盘，任务判成功，不会被重投；
+//  3. 所有 worker 在截止时间内退出则正常结束；截止到期仍不退出的
+//     handler（不理会取消）不再被等待，其上下文被取消、仍持有的租约
+//     一次性退回 pending，重启后/其他消费者处立即可重新投递（不丢任务）。
+//
+// 截止时间只从关闭那一刻起算，与进程此前已运行多久无关。
+// 已 Ack 成功的任务是终态，不会被退回；失控 handler 之后迟到的
+// Ack/Nack/进度上报会因租约令牌已轮换而被拒绝。
 func (c *Consumer) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// 在途 handler 的上下文不继承父 ctx：关闭只表示停止拉新，
+	// 不应顺手掐断手上的任务；它的截止时间从关闭时刻才开始。
+	handlerCtx, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelHandlers()
 
+	// worker 立即启动并正常消费；pollCtx 即父 ctx，未关闭前不设任何时长上限。
 	var wg sync.WaitGroup
 	for i := 0; i < c.workers; i++ {
 		wg.Add(1)
-		go c.worker(ctx, i, &wg)
+		go c.worker(ctx, handlerCtx, i, &wg)
 	}
 
 	workersDone := make(chan struct{})
@@ -129,15 +140,27 @@ func (c *Consumer) Run(ctx context.Context) error {
 		close(workersDone)
 	}()
 
+	// 正常消费阶段没有任何时限：消费者是常驻进程，跑多久都不会自我终止。
+	// 一直阻塞到真正收到关闭（ctx 取消）为止。
+	<-ctx.Done()
+	c.logger.Printf("instance=%s shutdown signaled, stop pulling new tasks; inflight handlers keep a full grace period of %s",
+		c.instance, c.shutdownTimeoutLabel())
+
+	timedOut := false
 	if c.shutdownTimeout > 0 {
+		// 关键：计时器在收到关闭之后才创建，消费者此前运行多久都不消耗宽限。
 		timer := time.NewTimer(c.shutdownTimeout)
 		defer timer.Stop()
 		select {
 		case <-workersDone:
-			c.logger.Printf("instance=%s all workers exited within shutdown deadline %s",
+			c.logger.Printf("instance=%s all workers exited within shutdown deadline %s (measured from shutdown)",
 				c.instance, c.shutdownTimeout)
 		case <-timer.C:
-			c.logger.Printf("instance=%s shutdown deadline %s exceeded, "+
+			timedOut = true
+			// 截止到点仍有 handler 不退出：取消其上下文（响应取消的 handler 可据此收尾），
+			// 但不再等待它们，Run 有界地返回。
+			cancelHandlers()
+			c.logger.Printf("instance=%s shutdown deadline %s exceeded (measured from shutdown), "+
 				"force-releasing inflight leases without waiting for runaway handler(s)",
 				c.instance, c.shutdownTimeout)
 		}
@@ -151,49 +174,69 @@ func (c *Consumer) Run(ctx context.Context) error {
 		c.logger.Printf("instance=%s shutdown requeue failed: %v", c.instance, err)
 		return err
 	}
-	c.logger.Printf("instance=%s graceful shutdown complete, requeued=%d unfinished task(s)",
-		c.instance, requeued)
+	basis := "all inflight handlers exited within grace period"
+	if timedOut {
+		basis = "runaway handler(s) ignored grace-period cancellation; leases force-released"
+	}
+	c.logger.Printf("instance=%s graceful shutdown complete, requeued=%d unfinished task(s) basis=%q",
+		c.instance, requeued, basis)
 	return nil
 }
 
-func (c *Consumer) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
+// shutdownTimeoutLabel 仅用于日志展示关闭等待上限。
+func (c *Consumer) shutdownTimeoutLabel() string {
+	if c.shutdownTimeout > 0 {
+		return c.shutdownTimeout.String()
+	}
+	return "unlimited"
+}
+
+// worker 循环拉取并处理任务。
+//   - pollCtx 取消（收到关闭）后立即停止拉取新任务并退出循环；
+//   - 已在途的一次投递使用 handlerCtx：它在关闭后的完整宽限期内不会被
+//     取消，handler 只要在宽限内跑完就能正常给出终局判定。
+func (c *Consumer) worker(pollCtx, handlerCtx context.Context, id int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-pollCtx.Done():
 			return
 		default:
 		}
 
-		lease, err := c.queue.Dequeue(ctx)
+		lease, err := c.queue.Dequeue(pollCtx)
 		if err != nil {
-			if ctx.Err() != nil {
+			if pollCtx.Err() != nil {
 				return
 			}
 			c.logger.Printf("worker=%d dequeue error: %v", id, err)
-			if !sleep(ctx, c.pollInterval) {
+			if !sleep(pollCtx, c.pollInterval) {
 				return
 			}
 			continue
 		}
 		if lease == nil {
-			if !sleep(ctx, c.pollInterval) {
+			if !sleep(pollCtx, c.pollInterval) {
 				return
 			}
 			continue
 		}
-		c.handle(ctx, id, lease)
+		c.handle(handlerCtx, pollCtx, id, lease)
 	}
 }
 
 // handle 处理一次投递并给出终局判定；所有判定都会打印任务标识、投递次数与依据。
-func (c *Consumer) handle(ctx context.Context, workerID int, lease *Lease) {
+//
+// handlerCtx 是本次投递的处理上下文（关闭后仍享有完整宽限期）；
+// pollCtx 仅用于判断是否已经收到关闭：收到关闭后 handler 才失败返回时，
+// 不再走带退避的 Nack（退避没有意义），交给 RequeueOwned 立即退回可投递。
+func (c *Consumer) handle(handlerCtx, pollCtx context.Context, workerID int, lease *Lease) {
 	task := lease.Task
 	c.logger.Printf("worker=%d deliver task=%s attempt=%d/%d basis=%q",
 		workerID, task.ID, task.Attempts, task.MaxAttempts,
 		"pending-visible-or-lease-expired")
 
-	err := c.handler(withProgressReporter(ctx, c.queue, task.ID, lease.Token), task.Clone())
+	err := c.handler(withProgressReporter(handlerCtx, c.queue, task.ID, lease.Token), task.Clone())
 
 	switch {
 	case err == nil:
@@ -213,8 +256,10 @@ func (c *Consumer) handle(ctx context.Context, workerID int, lease *Lease) {
 			workerID, task.ID, task.Attempts, "handler returned nil and lease token matched")
 
 	default:
-		// 关闭进行中：不再 Nack（退避没有意义），交给 RequeueOwned 立即退回。
-		if ctx.Err() != nil {
+		// 已收到关闭：不再 Nack（退避没有意义），交给 RequeueOwned 立即退回。
+		// 注意这里看的是 pollCtx（关闭信号）而非 handlerCtx：关闭后的宽限期内
+		// handlerCtx 仍未取消，handler 在宽限内跑完返回 nil 仍会正常 Ack 成功。
+		if pollCtx.Err() != nil {
 			c.logger.Printf("worker=%d abandon task=%s attempt=%d verdict=requeued-on-shutdown basis=%q",
 				workerID, task.ID, task.Attempts, "context canceled before nack")
 			return
