@@ -65,7 +65,10 @@ func WithPollInterval(d time.Duration) ConsumerOption {
 	return func(c *Consumer) { c.pollInterval = d }
 }
 
-// WithShutdownTimeout 设置优雅关闭等待在途 handler 退出的截止时间。
+// WithShutdownTimeout 设置收到关闭（Run 的 ctx 被取消）后等待在途 handler
+// 退出的截止时间。该时长**只在关闭后才开始计时**：正常运行期间不计时，
+// 消费者常驻多久、任务跑多久都不会触发它；关闭后无论进程此前运行了多久，
+// 都会重新拿到这份完整的等待时间。
 // 到期仍未退出的 handler 不再被等待：其租约被强制退回 pending，
 // 任务重新可投递（不丢任务）；handler 之后迟到的 Ack/Nack 会因令牌
 // 已轮换而被拒绝。默认 30s；<=0 表示无限等待（不推荐）。
@@ -102,17 +105,23 @@ func NewConsumer(q *Queue, workers int, h Handler, opts ...ConsumerOption) *Cons
 	return c
 }
 
-// Run 启动 worker 循环直到 ctx 被取消：
-//  1. 停止拉取新任务；
-//  2. 取消在途任务的处理上下文，等待所有 worker 退出，
-//     最长等待 shutdownTimeout（默认 30s，WithShutdownTimeout 可调）；
+// Run 启动 worker 循环并持续消费，直到 ctx 被取消才开始优雅关闭。
+// 正常运行期间没有任何时间上限：消费者可以常驻数小时、单个任务可以
+// 运行任意长时间，shutdownTimeout 绝不参与正常运行阶段。
+//
+// ctx 取消后的关闭流程：
+//  1. worker 停止拉取新任务，在途任务的处理上下文被取消；
+//  2. 从关闭这一刻起重新计时，等待所有 worker 退出，
+//     最长等待 shutdownTimeout（默认 30s，WithShutdownTimeout 可调），
+//     等待时长与进程此前已运行多久无关——关闭后总是拿到完整的等待额度，
+//     在途 handler 只要在此期间跑完，其成功结果仍会正常 Ack 落盘；
 //  3. 将本实例仍持有（未 Ack/Nack）的租约一次性退回 pending，
 //     使其在重启后/其他消费者处立即可重新投递。
 //
 // 关闭前已成功完成的任务仍会正常 Ack 落盘，不会被退回。
-// 若等待超过截止时间仍有 handler 不退出（不理会取消），Run 不再阻塞：
-// 强制退回这些在途租约后直接返回，任务不会丢失；失控 handler 后续
-// 迟到的 Ack/Nack/进度上报会因租约令牌已轮换而被拒绝。
+// 只有从关闭起算、等满 shutdownTimeout 仍不退出（不理会取消）的失控
+// handler，Run 才不再等待：强制退回这些在途租约后直接返回，任务不会丢失；
+// 失控 handler 后续迟到的 Ack/Nack/进度上报会因租约令牌已轮换而被拒绝。
 func (c *Consumer) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -123,12 +132,19 @@ func (c *Consumer) Run(ctx context.Context) error {
 		go c.worker(ctx, i, &wg)
 	}
 
+	// 正常运行阶段：只等待关闭信号，不设任何定时器。
+	// 进程常驻多久、单个任务跑多久都不会触发自我终止或释放租约。
+	<-ctx.Done()
+	c.logger.Printf("instance=%s shutdown requested, waiting up to %s for inflight handler(s)",
+		c.instance, c.shutdownLabel())
+
 	workersDone := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(workersDone)
 	}()
 
+	// 截止时间从关闭这一刻才开始起算，与 Run 此前的运行时长无关。
 	if c.shutdownTimeout > 0 {
 		timer := time.NewTimer(c.shutdownTimeout)
 		defer timer.Stop()
@@ -246,6 +262,14 @@ func withProgressReporter(ctx context.Context, q *Queue, taskID, token string) c
 		taskID: taskID,
 		token:  token,
 	})
+}
+
+// shutdownLabel 返回关闭等待额度的可读描述（<=0 为无限等待）。
+func (c *Consumer) shutdownLabel() string {
+	if c.shutdownTimeout > 0 {
+		return c.shutdownTimeout.String()
+	}
+	return "forever"
 }
 
 // sleep 在 ctx 取消时立即返回 false。

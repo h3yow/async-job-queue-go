@@ -64,13 +64,29 @@
 
 ### 4. 优雅关闭（带截止时间）
 
-`Consumer.Run` 在 `ctx` 取消后：
+**`shutdownTimeout` 只在收到关闭之后才起作用，正常运行期间完全不计时。**
+消费者是常驻进程：无论已经运行了多久、单个任务已经跑了几分钟，只要 `ctx`
+没有被取消，worker 就会一直正常消费，**绝不会因为"运行时长超过关闭等待
+上限"而自我终止，也不会提前放掉手上的在途任务**。关闭等待上限衡量的是
+"收到关闭后愿意等在途 handler 多久"，不是进程/任务的寿命上限。
 
-1. worker 停止拉取新任务，在途 handler 的 context 被取消；
-2. 等待所有 worker 退出，**最长等待 `shutdownTimeout`**（默认 30s，`WithShutdownTimeout` 可调；`<=0` 表示无限等待）。关闭前已处理成功的任务仍会正常 Ack 落盘；
-3. 调用 `RequeueOwned` 把本实例仍持有的未完成租约**立即退回 `pending`**（退避为 0），重启后或其他实例无需等待租约超时即可接管。
+`Consumer.Run` 的完整时序：
 
-**截止时间到期仍有 handler 不退出**（不理会取消、一直跑）时，Run 不再无限阻塞：
+0. **正常运行阶段（无任何时间上限）**：worker 持续拉取并处理任务，
+   关闭定时器处于未启动状态。进程跑数小时、单个任务跑数分钟都不受影响。
+1. `ctx` 被取消（收到关闭信号）：worker 停止拉取新任务，在途 handler 的
+   context 被取消（handler 可以选择响应、也可以继续跑完）；
+2. **从这一刻起**才开始计时，等待所有 worker 退出，**最长等待
+   `shutdownTimeout`**（默认 30s，`WithShutdownTimeout` 可调；`<=0` 表示
+   无限等待）。等待额度与进程此前已运行多久**完全无关**——哪怕之前已经
+   常驻了一整天，关闭后仍然拿到完整的一份等待时间。因此在途 handler 只要
+   在这份完整额度内跑完（即使它不理会取消信号），就会正常 Ack 落盘判成功，
+   不会被提前掐断、也不会被重投；
+3. 等待结束后调用 `RequeueOwned`，把本实例仍持有的未完成租约**立即退回
+   `pending`**（退避为 0），重启后或其他实例无需等待租约超时即可接管。
+
+**只有从关闭起算、等满整个 `shutdownTimeout` 仍不退出**（不理会取消、一直
+跑）的失控 handler，Run 才不再等待：
 
 - 强制退回这些在途租约后直接返回，任务回到 `pending` **重新可投递、不会丢**；
 - 强制退回会轮换租约令牌，失控 handler 之后迟到的 Ack/Nack/进度上报都会被拒绝（`ErrInvalidLease`），不会覆盖新一轮投递的结论与进度；
@@ -183,6 +199,7 @@ go test ./... -race -count=1 -v
 | `TestProgressRetainedAfterTerminalStates` | succeeded/dead 终态后进度仍可查，重启后一致 |
 | `TestOldDataFileWithoutProgressLoads` | 无 progress 字段的旧数据文件直接加载，功能不受影响 |
 | `TestShutdownTimeoutForceRequeuesInflight` | 关闭截止到期强制释放在途租约，任务重新可投递、已 Ack 任务不受影响 |
+| `TestShutdownDeadlineStartsOnlyAfterShutdown` | 正常运行远超关闭上限也不退出/不放任务；关闭后给完整等待窗口，上限内跑完判成功、到点不退才释放 |
 | `TestProgressReportingDoesNotBlockProcessing` | 长任务频繁上报进度时其他任务正常完成 |
 | `TestFileStoreRoundTrip` / `TestFileStoreNoLeftoverTempFiles` | 持久化往返与原子替换 |
 
@@ -193,6 +210,40 @@ go test ./... -race -count=1 -v
 [queue-log] worker=0 stale-ack task=task-xxxx attempt=1 verdict=rejected basis="lease token mismatch (visibility timeout)"
 [assert] task=task-xxxx attempts=5 verdict=dead reason="retry budget exhausted ..." basis="retryable failure and attempts == max -> dead letter"
 ```
+
+### 手工复现：正常运行不受关闭上限影响、关闭后的两种结局
+
+关闭等待上限从**收到关闭**才开始计时。可用 demo 直观验证这两点：
+
+```bash
+# 准备一个耗时明显长于关闭等待上限的长任务（slow:<秒>:...）
+go run ./cmd/demo -data /tmp/ajq-demo/verify.json -run=-1s -enqueue 'slow:20:export'
+
+# 情况一（正常运行）：-run 5s、-shutdown-timeout 1s。
+# 进程正常运行 5s（远超 1s 上限）期间绝不能自动收摊：
+# 长任务持续上报进度、worker 持续消费，日志里不会出现
+# "shutdown deadline exceeded"，任务也不会在关闭前被退回。
+go run ./cmd/demo -data /tmp/ajq-demo/verify.json -workers 1 -run 5s -shutdown-timeout 1s
+
+# 情况二（关闭后的两种结局）：-run 0 常驻，用 Ctrl-C（SIGINT）触发关闭。
+# - 关闭后仍在途、能在 1s 内跑完的任务：正常 ack 判成功（可把 slow 改成
+#   slow:1:... 观察）；
+# - 到 1s 仍不退出的任务：日志出现 "force-releasing inflight leases"，
+#   任务回到 pending；再启动一次会看到它以 attempt=2 被重新投递。
+go run ./cmd/demo -data /tmp/ajq-demo/verify.json -workers 1 -run 0 -shutdown-timeout 1s
+# （再运行一次观察重新投递；succeeded 任务保持终态、不会再投。）
+```
+
+自动化复现（无需人工计时，CI 可稳定运行）：
+
+```bash
+go test ./queue/ -run TestShutdownDeadlineStartsOnlyAfterShutdown -race -count=1 -v
+```
+
+该用例先让消费者正常运行 `4 × shutdownTimeout`（期间不关闭）并断言消费者
+不退出、在途任务保持 `running/attempt=1`；随后才触发关闭，断言：在半个
+上限处放行的任务于上限内跑完 → `succeeded/attempt=1`，到点仍不退出的任务
+→ 强制退回 `pending`、`attempt=2` 重投，且旧执行迟到的 Ack/进度上报被拒。
 
 ### 命令行演示
 

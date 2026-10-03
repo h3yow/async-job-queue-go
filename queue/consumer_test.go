@@ -21,7 +21,13 @@ func consumerConfig() Config {
 // 全部到达 succeeded，不出现重复成功。
 func TestConcurrentConsumersProcessEachTaskOnce(t *testing.T) {
 	path := t.TempDir() + "/queue.json"
-	q, err := New(consumerConfig(), NewFileStore(path), "inst-conc")
+	concCfg := consumerConfig()
+	// 给足租约窗口：本用例断言"可见性窗口内每任务恰好处理一次"，
+	// 不是验证租约超时重投（后者由 TestLeaseTakeoverAcrossInstances 覆盖）。
+	// 在 -race 调度抖动下 50ms 短租约可能在 2ms handler 执行中途到期造成
+	// 非预期重投，使该断言偶发失败，这里用长租约消除该无关抖动。
+	concCfg.LeaseDuration = time.Hour
+	q, err := New(concCfg, NewFileStore(path), "inst-conc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,9 +58,20 @@ func TestConcurrentConsumersProcessEachTaskOnce(t *testing.T) {
 
 	waitFor(t, func() bool {
 		mu.Lock()
-		defer mu.Unlock()
-		return len(seen) == nTasks
-	}, "all tasks handled")
+		handled := len(seen) == nTasks
+		mu.Unlock()
+		if !handled {
+			return false
+		}
+		// handler 全部执行过还不够：必须等每个任务的 Ack 都落盘到 succeeded，
+		// 否则在 Ack 落盘前断言终态会偶发读到 running。
+		for _, id := range ids {
+			if g, ok := q.Get(id); !ok || g.Status != StatusSucceeded {
+				return false
+			}
+		}
+		return true
+	}, "all tasks handled and acked as succeeded")
 
 	for _, id := range ids {
 		if g := statusOf(t, q, id); g.Status != StatusSucceeded {
